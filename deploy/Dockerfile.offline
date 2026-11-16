@@ -6,6 +6,13 @@
 # works in air-gapped / offline deployments or for workloads that edit documents
 # often.
 #
+# It also bakes in the enable-hub-model plugin under
+# /opt/qwenpaw-baked-plugins; entrypoint.sh copies it into the effective
+# working dir's plugins/ on first start (the working dir is often a bind mount
+# or volume, which would hide image content). Override
+# ENABLE_HUB_MODEL_PLUGIN_URL to use a mirror or a different version; set it to
+# an empty string to skip the plugin.
+#
 # Build (from repo root):
 #   DOCKERFILE=deploy/Dockerfile.offline bash scripts/docker_build.sh qwenpaw:offline
 # or:
@@ -14,10 +21,10 @@
 #     -t qwenpaw:offline .
 #
 # Keep this file in sync with `deploy/Dockerfile`: everything outside the
-# "Office / PDF toolchain" blocks below must stay identical. If that becomes a
-# maintenance burden, the alternative is an opt-in build arg in the default
-# Dockerfile, which was intentionally avoided here so the default image and its
-# build cache are unaffected.
+# "Office / PDF toolchain" and "Enable Hub default model plugin" blocks below
+# must stay identical. If that becomes a maintenance burden, the alternative is
+# an opt-in build arg in the default Dockerfile, which was intentionally avoided
+# here so the default image and its build cache are unaffected.
 #
 # Base images — override with --build-arg for environments without ACR access.
 ARG NODE_IMAGE=agentscope-registry.ap-southeast-1.cr.aliyuncs.com/agentscope/node:slim
@@ -219,6 +226,52 @@ COPY --from=console-builder /app/console/dist/ ./src/qwenpaw/console/
 # channel. The pin keeps every environment in the known-good state.
 RUN uv pip install --python /app/venv/bin/python \
     --no-cache-dir . "setuptools<82" && rm -rf ./build
+
+# -----------------------------------------------------------------------------
+# Enable Hub default model plugin.
+# Stored under /opt rather than /app/working because at runtime the working dir
+# may be a bind mount (/workspace in Hub mode) or a named volume, either of
+# which hides image content. entrypoint.sh seeds missing baked plugins into
+# ${QWENPAW_WORKING_DIR}/plugins on start. The archive is a zip with a single
+# top-level `enable-hub-model/` directory; fall back to searching for
+# plugin.json in case the layout changes. Runs at build time only; the runtime
+# stays offline-capable.
+#
+# For offline builds the archive can be placed in deploy/baked-plugins/ (copied
+# into the build context below) and referenced either by file name or by an
+# absolute host path; only the basename is used to locate it inside the context.
+# http(s)/ftp URLs keep using curl. Set ENABLE_HUB_MODEL_PLUGIN_URL= (empty) to
+# skip baking the plugin entirely.
+# -----------------------------------------------------------------------------
+ARG ENABLE_HUB_MODEL_PLUGIN_URL=https://github.com/Ligandlly/qwenpaw-enable-hub-model-plugin/releases/download/v1.0.0/enable-hub-model-1.0.0.zip
+COPY deploy/baked-plugins/ /tmp/baked-plugin-archives/
+RUN if [ -n "${ENABLE_HUB_MODEL_PLUGIN_URL}" ]; then \
+        set -eux; \
+        tmp="$(mktemp -d)"; \
+        case "${ENABLE_HUB_MODEL_PLUGIN_URL}" in \
+            http://*|https://*|ftp://*|ftps://*) \
+                curl -fsSL --retry 3 -o "$tmp/plugin.zip" "${ENABLE_HUB_MODEL_PLUGIN_URL}" ;; \
+            file://*) \
+                cp "${ENABLE_HUB_MODEL_PLUGIN_URL#file://}" "$tmp/plugin.zip" ;; \
+            *) \
+                archive="/tmp/baked-plugin-archives/$(basename "${ENABLE_HUB_MODEL_PLUGIN_URL}")"; \
+                if [ ! -f "$archive" ]; then \
+                    archive="${ENABLE_HUB_MODEL_PLUGIN_URL}"; \
+                fi; \
+                test -f "$archive"; \
+                cp "$archive" "$tmp/plugin.zip" ;; \
+        esac; \
+        python3 -m zipfile -e "$tmp/plugin.zip" "$tmp/extracted"; \
+        plugin_dir="$tmp/extracted/enable-hub-model"; \
+        if [ ! -f "$plugin_dir/plugin.json" ]; then \
+            plugin_dir="$(dirname "$(find "$tmp/extracted" -name plugin.json -print -quit)")"; \
+        fi; \
+        test -f "$plugin_dir/plugin.json"; \
+        mkdir -p /opt/qwenpaw-baked-plugins; \
+        rm -rf /opt/qwenpaw-baked-plugins/enable-hub-model; \
+        cp -a "$plugin_dir" /opt/qwenpaw-baked-plugins/enable-hub-model; \
+        rm -rf "$tmp"; \
+    fi
 
 
 # QwenPaw app port (default 8088). Override at runtime with -e QWENPAW_PORT=3000.

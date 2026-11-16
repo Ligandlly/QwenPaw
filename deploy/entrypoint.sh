@@ -33,6 +33,44 @@ Recommended:
 EOF
 }
 
+# Seed plugins baked into the image (deploy/Dockerfile.offline) into the
+# effective working dir. The working dir may be a bind mount (/workspace in
+# Hub mode) or a named volume, both of which hide image content, so copy each
+# missing baked plugin on start. `.baked-plugins` remembers what we already
+# handled: a plugin the user later uninstalls (or disables) stays that way,
+# while plugins added by a newer image are still seeded. Images without
+# /opt/qwenpaw-baked-plugins (e.g. the default deploy/Dockerfile) are unaffected.
+seed_baked_plugins() {
+  baked_dir="/opt/qwenpaw-baked-plugins"
+  [ -d "$baked_dir" ] || return 0
+
+  plugins_dir="${QWENPAW_WORKING_DIR:-/app/working}/plugins"
+  marker="$plugins_dir/.baked-plugins"
+  mkdir -p "$plugins_dir"
+
+  for source in "$baked_dir"/*; do
+    [ -d "$source" ] || continue
+    [ -f "$source/plugin.json" ] || continue
+    plugin_id="$(basename "$source")"
+
+    if grep -qxF "$plugin_id" "$marker" 2>/dev/null; then
+      continue
+    fi
+
+    target="$plugins_dir/$plugin_id"
+    if [ ! -e "$target" ] && [ ! -e "$target.disabled" ]; then
+      if ! cp -a "$source" "$target"; then
+        echo "⚠️  Failed to seed baked plugin: ${plugin_id}" >&2
+        continue
+      fi
+      echo "✓ Seeded baked plugin: ${plugin_id}"
+    fi
+    printf '%s\n' "$plugin_id" >> "$marker"
+  done
+}
+
+seed_baked_plugins
+
 # Auto-initialize if config.json is missing (bind mount with empty directory).
 if [ ! -f "${QWENPAW_WORKING_DIR}/config.json" ]; then
   echo "⚠️  No config.json found in ${QWENPAW_WORKING_DIR}"
