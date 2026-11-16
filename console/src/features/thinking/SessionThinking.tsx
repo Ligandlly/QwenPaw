@@ -1,6 +1,6 @@
 import { ModelPickerPopover } from "../../pages/Chat/ModelSelector/ModelPickerPopover";
 import { useEffect, useRef, useState } from "react";
-import { Collapse, Flex, Spin, Switch, Tooltip } from "antd";
+import { Spin, Tooltip } from "antd";
 import { ChevronDown, ArrowLeft, RotateCcw, Plug } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAppMessage } from "@/hooks/useAppMessage";
@@ -11,29 +11,32 @@ import {
   sessionThinkingApi,
   setPendingThinking,
 } from "./sessionThinkingApi";
-import type {
-  DecisionSettings,
-  ThinkingPreference,
-  ThinkingView,
-} from "./types";
+import type { ThinkingPreference, ThinkingView } from "./types";
 import {
   readPendingModel,
   resetSessionModel,
-  saveDecisionSettings,
 } from "../session-settings/sessionModel";
+import { isSessionModelChangedFor } from "../session-settings/sessionModelEvents";
 import ModelSelector from "../../pages/Chat/ModelSelector";
 import { ProviderIcon } from "../../pages/Settings/Models/components/ProviderIconComponent";
 import { useTurnUsageStore } from "../../pages/Chat/turnUsageStore";
+import {
+  enqueueSessionThinkingWrite,
+  sessionThinkingScope,
+  waitForSessionThinkingWrites,
+} from "./sessionThinkingWrites";
 import styles from "./thinking.module.less";
 
 export function SessionThinking({
   agentId,
   sessionId,
   chatId,
+  onDecisionConfiguredChange,
 }: {
   agentId: string;
   sessionId: string;
   chatId?: string | null;
+  onDecisionConfiguredChange?: (configured: boolean | undefined) => void;
 }) {
   const { t } = useTranslation();
   const { message } = useAppMessage();
@@ -42,31 +45,46 @@ export function SessionThinking({
   const [choosing, setChoosing] = useState(false);
   const [preview, setPreview] = useState<ThinkingPreference>();
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const generation = useRef(0);
+  const previewRevision = useRef(0);
   const revision = useRef(0);
-  const identity = `${agentId}:${sessionId}:${chatId ?? ""}`;
+  const identity = JSON.stringify([agentId, sessionId, chatId ?? null]);
+  const scope = sessionThinkingScope(agentId, sessionId, chatId);
   const identityRef = useRef(identity);
   identityRef.current = identity;
   useEffect(() => {
+    generation.current += 1;
+    onDecisionConfiguredChange?.(undefined);
     setOpen(false);
     setChoosing(false);
     setView(undefined);
     setPreview(undefined);
     setBusy(false);
+    setSaving(false);
     revision.current += 1;
     void load();
-    const refresh = () => {
-      void load();
+    const refresh = (event: Event) => {
+      if (isSessionModelChangedFor(event, { agentId, sessionId, chatId }))
+        void load();
     };
     window.addEventListener("session-model-changed", refresh);
     return () => {
+      generation.current += 1;
       revision.current += 1;
       window.removeEventListener("session-model-changed", refresh);
     };
-  }, [identity]);
+  }, [identity, onDecisionConfiguredChange]);
   async function load() {
     const version = ++revision.current;
     setBusy(true);
     try {
+      const pendingWrites = waitForSessionThinkingWrites(scope);
+      if (pendingWrites) {
+        await pendingWrites;
+        if (identityRef.current !== identity || revision.current !== version)
+          return;
+      }
       const next = await sessionThinkingApi.get(agentId, chatId, sessionId);
       if (identityRef.current !== identity || revision.current !== version)
         return;
@@ -75,51 +93,63 @@ export function SessionThinking({
           readPendingThinking(agentId, sessionId, next.model_key) ?? next.value;
       setPreview(undefined);
       setView(next);
+      onDecisionConfiguredChange?.(next.decision_model_configured);
       useTurnUsageStore
         .getState()
         .setActiveMaxInputLength(next.effective_max_input_length ?? null);
     } catch (error) {
-      if (identityRef.current === identity) message.error(String(error));
-    } finally {
       if (identityRef.current === identity && revision.current === version)
+        message.error(String(error));
+    } finally {
+      if (identityRef.current === identity && revision.current === version) {
         setBusy(false);
+        setSaving(false);
+      }
     }
   }
-  async function save(value: ThinkingPreference | DecisionSettings) {
+  function updatePreview(value: ThinkingPreference) {
+    previewRevision.current += 1;
+    setPreview(value);
+  }
+  async function save(value: ThinkingPreference) {
     if (!view || busy) return;
-    if ("level" in value) setPreview(value);
+    updatePreview(value);
+    const edit = previewRevision.current;
+    const owner = generation.current;
     const version = ++revision.current;
-    setBusy(true);
+    if (!chatId) {
+      setPendingThinking(agentId, sessionId, value, view.model_key);
+      setView({ ...view, value, reason: null });
+      setPreview(undefined);
+      return;
+    }
+    setSaving(true);
     try {
-      const next =
-        "enabled" in value
-          ? {
-              ...view,
-              decision: await saveDecisionSettings(
-                agentId,
-                { sessionId, chatId },
-                value,
-              ),
-            }
-          : chatId
-          ? await sessionThinkingApi.set(agentId, chatId, value, view.model_key)
-          : { ...view, value, reason: null };
-      if (identityRef.current === identity && revision.current === version) {
+      const next = await enqueueSessionThinkingWrite(scope, async () => {
+        const result = await sessionThinkingApi.set(
+          agentId,
+          chatId,
+          value,
+          view.model_key,
+        );
+        setPendingThinking(agentId, sessionId, null, view.model_key);
+        return result;
+      });
+      if (generation.current === owner && identityRef.current === identity) {
         setView(next);
-        if ("level" in value)
-          setPendingThinking(
-            agentId,
-            sessionId,
-            chatId ? null : value,
-            view.model_key,
-          );
+        onDecisionConfiguredChange?.(next.decision_model_configured);
       }
     } catch (error) {
-      if (identityRef.current === identity) message.error(String(error));
+      if (generation.current === owner && identityRef.current === identity)
+        message.error(String(error));
     } finally {
-      if (identityRef.current === identity && revision.current === version) {
-        setBusy(false);
-        setPreview(undefined);
+      if (
+        generation.current === owner &&
+        identityRef.current === identity &&
+        revision.current === version
+      ) {
+        setSaving(false);
+        if (previewRevision.current === edit) setPreview(undefined);
       }
     }
   }
@@ -127,7 +157,7 @@ export function SessionThinking({
     !!view &&
     (view.model_source === "session" || view.value.level !== "inherit");
   async function resetModel() {
-    if (busy || !canReset) return;
+    if (busy || saving || !canReset) return;
     setBusy(true);
     try {
       await resetSessionModel(agentId, { sessionId, chatId });
@@ -147,7 +177,7 @@ export function SessionThinking({
         type="button"
         className={styles.iconButton}
         aria-label={t("thinkingControl.resetModel")}
-        disabled={busy || !canReset}
+        disabled={busy || saving || !canReset}
         onClick={() => void resetModel()}
       >
         <RotateCcw size={15} />
@@ -169,7 +199,7 @@ export function SessionThinking({
         setOpen(next);
         if (!next) {
           setChoosing(false);
-          setPreview(undefined);
+          if (!saving) setPreview(undefined);
         }
         if (next) void load();
       }}
@@ -203,11 +233,11 @@ export function SessionThinking({
               />
             </>
           ) : (
-            <Spin spinning={busy}>
+            <Spin spinning={busy && !view}>
               {view?.model && (
                 <ThinkingControl
                   control={view.control}
-                  value={value}
+                  value={displayedValue}
                   effective={view.effective}
                   modelLabel={
                     view.model_name ||
@@ -218,45 +248,11 @@ export function SessionThinking({
                   }
                   resetAction={resetModelButton}
                   onChooseModel={() => setChoosing(true)}
-                  onPreview={setPreview}
+                  onPreview={updatePreview}
                   onChange={(next) => void save(next)}
                   disabled={busy}
                 />
               )}
-              <Collapse
-                key={identity}
-                ghost
-                expandIconPosition="end"
-                items={[
-                  {
-                    key: "advanced",
-                    label: t("chat.sessionSettings.advanced"),
-                    children: (
-                      <Flex
-                        component="label"
-                        align="center"
-                        justify="space-between"
-                      >
-                        {t("chat.sessionSettings.decisionEnabled")}
-                        <Switch
-                          size="small"
-                          aria-label={t("chat.sessionSettings.decisionEnabled")}
-                          checked={view?.decision?.enabled ?? false}
-                          disabled={busy || !view?.decision?.configured}
-                          onChange={(enabled) =>
-                            view?.decision &&
-                            void save({
-                              ...view.decision,
-                              enabled,
-                              override: enabled,
-                            })
-                          }
-                        />
-                      </Flex>
-                    ),
-                  },
-                ]}
-              />
             </Spin>
           )}
         </div>
